@@ -1,9 +1,11 @@
 import asyncio
 import json
 import os
+import re
 import subprocess
+import time
 import uuid
-from typing import AsyncGenerator, Dict, Any, List
+from typing import AsyncGenerator, Dict, Any, List, Optional
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -18,6 +20,150 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # In-memory store for active pipeline runs
 _runs: Dict[str, Dict[str, Any]] = {}
+
+# ---------------------------------------------------------------------------
+# Live metrics helpers
+# ---------------------------------------------------------------------------
+
+# NUMA topology: populated once at startup
+_numa_map: Dict[int, List[int]] = {}  # node_id -> [cpu_ids]
+
+
+def _parse_numa_topology() -> Dict[int, List[int]]:
+    """Parse NUMA node -> CPU mapping from lscpu."""
+    result: Dict[int, List[int]] = {}
+    try:
+        out = subprocess.check_output("lscpu", text=True, timeout=5)
+        for line in out.splitlines():
+            m = re.match(r"NUMA node(\d+) CPU\(s\):\s+(.+)", line)
+            if not m:
+                continue
+            node = int(m.group(1))
+            cpus: List[int] = []
+            for part in m.group(2).split(","):
+                part = part.strip()
+                if "-" in part:
+                    lo, hi = part.split("-", 1)
+                    cpus.extend(range(int(lo), int(hi) + 1))
+                else:
+                    cpus.append(int(part))
+            result[node] = cpus
+    except Exception:
+        pass
+    return result
+
+
+def _read_proc_stat() -> Dict[int, List[int]]:
+    """Read per-CPU jiffies from /proc/stat. Returns {cpu_id: [user,nice,sys,idle,...]}."""
+    cpus: Dict[int, List[int]] = {}
+    try:
+        with open("/proc/stat") as f:
+            for line in f:
+                if line.startswith("cpu") and line[3] != " ":
+                    parts = line.split()
+                    cpu_id = int(parts[0][3:])
+                    cpus[cpu_id] = [int(x) for x in parts[1:]]
+    except Exception:
+        pass
+    return cpus
+
+
+# Previous snapshot for delta computation
+_prev_stat: Dict[int, List[int]] = {}
+_prev_time: float = 0.0
+
+
+def _compute_cpu_utilization() -> Dict[str, Any]:
+    """Compute overall and per-NUMA CPU utilization as percentages."""
+    global _prev_stat, _prev_time, _numa_map
+
+    if not _numa_map:
+        _numa_map = _parse_numa_topology()
+
+    cur = _read_proc_stat()
+    now = time.monotonic()
+
+    if not _prev_stat:
+        _prev_stat = cur
+        _prev_time = now
+        return {"overall": 0.0, "per_numa": {str(k): 0.0 for k in sorted(_numa_map)}}
+
+    def _usage(prev_vals: List[int], cur_vals: List[int]) -> float:
+        d = [c - p for c, p in zip(cur_vals, prev_vals)]
+        total = sum(d)
+        if total == 0:
+            return 0.0
+        idle = d[3] + (d[4] if len(d) > 4 else 0)  # idle + iowait
+        return round(100.0 * (1 - idle / total), 1)
+
+    # Overall
+    all_prev = [0] * 10
+    all_cur = [0] * 10
+    for cpu_id in cur:
+        if cpu_id in _prev_stat:
+            for i in range(min(len(cur[cpu_id]), 10)):
+                all_prev[i] += _prev_stat[cpu_id][i]
+                all_cur[i] += cur[cpu_id][i]
+    overall = _usage(all_prev, all_cur)
+
+    # Per-NUMA
+    per_numa: Dict[str, float] = {}
+    for node, cpu_ids in sorted(_numa_map.items()):
+        np = [0] * 10
+        nc = [0] * 10
+        for cid in cpu_ids:
+            if cid in cur and cid in _prev_stat:
+                for i in range(min(len(cur[cid]), 10)):
+                    np[i] += _prev_stat[cid][i]
+                    nc[i] += cur[cid][i]
+        per_numa[str(node)] = _usage(np, nc)
+
+    _prev_stat = cur
+    _prev_time = now
+    return {"overall": overall, "per_numa": per_numa}
+
+
+def _get_memory_info() -> Dict[str, Any]:
+    """Get system RAM usage from /proc/meminfo."""
+    info: Dict[str, int] = {}
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith(("MemTotal:", "MemAvailable:", "MemFree:")):
+                    parts = line.split()
+                    info[parts[0].rstrip(":")] = int(parts[1])  # in kB
+    except Exception:
+        pass
+    total = info.get("MemTotal", 0)
+    avail = info.get("MemAvailable", info.get("MemFree", 0))
+    used = total - avail
+    return {
+        "total_gb": round(total / (1024 * 1024), 1),
+        "used_gb": round(used / (1024 * 1024), 1),
+        "pct": round(100.0 * used / total, 1) if total else 0.0,
+    }
+
+
+def _get_gpu_info() -> Dict[str, Any]:
+    """Get GPU memory and utilization from nvidia-smi."""
+    try:
+        out = subprocess.check_output(
+            "nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total "
+            "--format=csv,noheader,nounits 2>/dev/null | head -1",
+            shell=True, text=True, timeout=5,
+        ).strip()
+        parts = [p.strip() for p in out.split(",")]
+        util = parts[0] if parts[0] != "[N/A]" else None
+        mem_used = int(parts[1]) if parts[1] != "[N/A]" else None
+        mem_total = int(parts[2]) if parts[2] != "[N/A]" else None
+        return {
+            "util_pct": float(util) if util else None,
+            "mem_used_mb": mem_used,
+            "mem_total_mb": mem_total,
+            "mem_pct": round(100.0 * mem_used / mem_total, 1) if mem_used and mem_total else None,
+        }
+    except Exception:
+        return {"util_pct": None, "mem_used_mb": None, "mem_total_mb": None, "mem_pct": None}
 
 
 INDEX_HTML = '''
@@ -124,6 +270,105 @@ INDEX_HTML = '''
         color: #64748b;
         margin-top: 2px;
       }
+
+      /* Utilization dashboard */
+      .util-section {
+        margin-top: 18px;
+        border-radius: 18px;
+        padding: 16px;
+        background: linear-gradient(180deg, #f0f9ff, #ffffff);
+        border: 1px solid #bae6fd;
+        box-shadow: 0 4px 16px rgba(0,0,0,.04);
+      }
+      .util-section h3 {
+        margin: 0 0 12px 0;
+        font-size: 14px;
+        color: #475569;
+      }
+      .util-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 12px;
+      }
+      .util-card {
+        border-radius: 12px;
+        padding: 10px 14px;
+        background: rgba(255,255,255,.85);
+        border: 1px solid #e2e8f0;
+      }
+      .util-card .util-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 6px;
+      }
+      .util-card .util-label {
+        font-size: 12px;
+        font-weight: 600;
+        color: #64748b;
+        text-transform: uppercase;
+        letter-spacing: 0.3px;
+      }
+      .util-card .util-pct {
+        font-size: 18px;
+        font-weight: 700;
+        color: #1e293b;
+      }
+      .util-bar-bg {
+        height: 8px;
+        border-radius: 4px;
+        background: #e2e8f0;
+        overflow: hidden;
+      }
+      .util-bar-fill {
+        height: 100%;
+        border-radius: 4px;
+        transition: width 0.5s ease, background 0.5s ease;
+      }
+      .util-bar-fill.cpu  { background: linear-gradient(90deg, #3b82f6, #2563eb); }
+      .util-bar-fill.mem  { background: linear-gradient(90deg, #8b5cf6, #7c3aed); }
+      .util-bar-fill.gpu  { background: linear-gradient(90deg, #10b981, #059669); }
+      .util-card .util-sub {
+        font-size: 11px;
+        color: #94a3b8;
+        margin-top: 4px;
+      }
+      .numa-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+        gap: 6px;
+        margin-top: 8px;
+      }
+      .numa-cell {
+        border-radius: 8px;
+        padding: 6px 8px;
+        background: rgba(255,255,255,.9);
+        border: 1px solid #e2e8f0;
+        text-align: center;
+      }
+      .numa-cell .numa-id {
+        font-size: 10px;
+        color: #94a3b8;
+        text-transform: uppercase;
+      }
+      .numa-cell .numa-pct {
+        font-size: 16px;
+        font-weight: 700;
+        color: #1e293b;
+      }
+      .numa-cell .numa-bar-bg {
+        height: 4px;
+        border-radius: 2px;
+        background: #e2e8f0;
+        margin-top: 3px;
+        overflow: hidden;
+      }
+      .numa-cell .numa-bar-fill {
+        height: 100%;
+        border-radius: 2px;
+        background: #3b82f6;
+        transition: width 0.5s ease;
+      }
     </style>
   </head>
   <body>
@@ -156,6 +401,41 @@ INDEX_HTML = '''
     </div>
 
     <div id="log"></div>
+
+    <!-- Utilization Dashboard -->
+    <div class="util-section">
+      <h3>Live System Utilization</h3>
+      <div class="util-grid">
+        <div class="util-card">
+          <div class="util-header">
+            <span class="util-label">CPU Overall</span>
+            <span class="util-pct" id="cpu-pct">--</span>
+          </div>
+          <div class="util-bar-bg"><div class="util-bar-fill cpu" id="cpu-bar" style="width:0%"></div></div>
+          <div class="util-sub" id="cpu-sub"></div>
+        </div>
+        <div class="util-card">
+          <div class="util-header">
+            <span class="util-label">System RAM</span>
+            <span class="util-pct" id="ram-pct">--</span>
+          </div>
+          <div class="util-bar-bg"><div class="util-bar-fill mem" id="ram-bar" style="width:0%"></div></div>
+          <div class="util-sub" id="ram-sub"></div>
+        </div>
+        <div class="util-card">
+          <div class="util-header">
+            <span class="util-label">GPU VRAM</span>
+            <span class="util-pct" id="gpu-pct">--</span>
+          </div>
+          <div class="util-bar-bg"><div class="util-bar-fill gpu" id="gpu-bar" style="width:0%"></div></div>
+          <div class="util-sub" id="gpu-sub"></div>
+        </div>
+      </div>
+      <div style="margin-top:12px;">
+        <div style="font-size:12px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:0.3px;margin-bottom:6px;">Per-NUMA Node CPU Utilization</div>
+        <div class="numa-grid" id="numa-grid"></div>
+      </div>
+    </div>
 
     <!-- Logo -->
     <div class="logo-container">
@@ -300,6 +580,67 @@ INDEX_HTML = '''
           bar.style.display = "flex";
         } catch(e) { /* silently skip if sysinfo unavailable */ }
       })();
+
+      // Live utilization polling
+      function updateBar(barId, pctId, pct, subId, subText) {
+        const bar = document.getElementById(barId);
+        const label = document.getElementById(pctId);
+        const sub = document.getElementById(subId);
+        if (pct != null) {
+          bar.style.width = pct + "%";
+          label.textContent = pct + "%";
+        } else {
+          bar.style.width = "0%";
+          label.textContent = "N/A";
+        }
+        if (sub && subText) sub.textContent = subText;
+      }
+
+      function renderNuma(perNuma) {
+        const grid = document.getElementById("numa-grid");
+        const nodes = Object.keys(perNuma).sort((a,b) => +a - +b);
+        // Build cells only once, then update
+        if (grid.children.length !== nodes.length) {
+          grid.innerHTML = nodes.map(n =>
+            '<div class="numa-cell" id="numa-' + n + '">' +
+              '<div class="numa-id">Node ' + n + '</div>' +
+              '<div class="numa-pct" id="numa-pct-' + n + '">--</div>' +
+              '<div class="numa-bar-bg"><div class="numa-bar-fill" id="numa-bar-' + n + '" style="width:0%"></div></div>' +
+            '</div>'
+          ).join("");
+        }
+        for (const n of nodes) {
+          const pct = perNuma[n];
+          document.getElementById("numa-pct-" + n).textContent = pct + "%";
+          const bar = document.getElementById("numa-bar-" + n);
+          bar.style.width = pct + "%";
+          // Color by intensity
+          if (pct > 70) bar.style.background = "#ef4444";
+          else if (pct > 40) bar.style.background = "#f59e0b";
+          else bar.style.background = "#3b82f6";
+        }
+      }
+
+      async function fetchMetrics() {
+        try {
+          const r = await fetch("/metrics");
+          const m = await r.json();
+          // CPU
+          updateBar("cpu-bar", "cpu-pct", m.cpu.overall, "cpu-sub", "");
+          // RAM
+          updateBar("ram-bar", "ram-pct", m.memory.pct, "ram-sub",
+            m.memory.used_gb + " / " + m.memory.total_gb + " GB");
+          // GPU
+          const gpuPct = m.gpu.mem_pct;
+          updateBar("gpu-bar", "gpu-pct", gpuPct, "gpu-sub",
+            m.gpu.mem_used_mb != null ? (m.gpu.mem_used_mb + " / " + m.gpu.mem_total_mb + " MiB") : "");
+          // NUMA
+          if (m.cpu.per_numa) renderNuma(m.cpu.per_numa);
+        } catch(e) { /* skip */ }
+      }
+
+      fetchMetrics();
+      setInterval(fetchMetrics, 2000);
     </script>
   </body>
 </html>
@@ -366,6 +707,16 @@ def sysinfo():
         "vm_size": vm_size or None,
     }
     return _sysinfo_cache
+
+
+@app.get("/metrics")
+def metrics():
+    """Return live CPU, memory, and GPU utilization."""
+    return {
+        "cpu": _compute_cpu_utilization(),
+        "memory": _get_memory_info(),
+        "gpu": _get_gpu_info(),
+    }
 
 
 @app.get("/mode")
